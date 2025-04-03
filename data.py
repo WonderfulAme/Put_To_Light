@@ -71,6 +71,11 @@ class PTL:
         self._solution_correspondence = {}
         self._order_times = {}
         self._zone_times = []
+        
+        # Optimization: Pre-computed values
+        self._sku_time_sums = {}
+        self._departure_time_lookup = {}
+        self._zone_lookup = {}
 
     def load_data(self):
         """
@@ -83,6 +88,8 @@ class PTL:
             self._load_departure_parameters()
             self._load_sku_parameters()
             self._initialize_solution()
+            # Optimization: Pre-compute frequently used values
+            self._precompute_values()
         except FileNotFoundError:
             self.logger.error(f"File not found: {self._option_data[self._option]}")
             raise
@@ -179,6 +186,28 @@ class PTL:
             index_col=0
         )
 
+    def _precompute_values(self):
+        """
+        Optimization: Pre-compute frequently used values to avoid repeated calculations.
+        """
+        # Pre-compute sum of SKU processing times for each order
+        self._sku_time_sums = {}
+        for order in self._orders_set:
+            self._sku_time_sums[order] = self._sku_time.loc[order].sum()
+        
+        # Create a faster lookup for departure times
+        self._departure_time_lookup = {}
+        for departure in self._departures_set:
+            zone = self._departures_per_zone[departure]
+            if zone in self._departure_time.index and departure in self._departure_time.columns:
+                self._departure_time_lookup[departure] = self._departure_time.loc[zone, departure]
+        
+        # Create a fast lookup for zone by departure
+        self._zone_lookup = self._departures_per_zone.copy()
+        
+        # Pre-compute zone index mapping for faster zone time updates
+        self._zone_indices = {zone: idx for idx, zone in enumerate(self._zones_set)}
+
     def _initialize_solution(self):
         """
         Create an initial solution with orders assigned to departures.
@@ -196,21 +225,20 @@ class PTL:
         """
         return len(self._solution) == len(self._orders_set) and all(order in self._solution for order in self._orders_set) and len(set(self._solution.values())) == len(set(self._solution.keys()))
     
-
     def compute_order_time(self, order: str, departure: str) -> float:
         """
         Compute total time for processing a specific order.
         
         :param order: Order identifier
+        :param departure: Departure identifier
         :return: Total time for order processing
         """
-        zone = self._departures_per_zone[departure]
-
-        # Compute SKU processing times for the order
-        sku_processing_times = self._sku_time.loc[order]
-        departure_processing_time = self._departure_time.loc[zone, departure]
+        # Optimization: Use pre-computed values instead of dataframe lookups
+        sku_processing_time = self._sku_time_sums[order]
+        departure_processing_time = self._departure_time_lookup[departure]
         total_processing_time = departure_processing_time * self._n_skus_per_order[order]
-        return sku_processing_times.sum() + total_processing_time
+        
+        return sku_processing_time + total_processing_time
 
     def compute_order_times(self) -> Dict[str, float]:
         """
@@ -218,10 +246,12 @@ class PTL:
         
         :return: Dictionary of order times
         """
-        order_times = {
-            order: self.compute_order_time(order, self._solution[order])
-            for order in self._orders_set
-        }
+        # Optimization: Use pre-allocated dictionary and avoid method call overhead
+        order_times = {}
+        for order in self._orders_set:
+            departure = self._solution[order]
+            order_times[order] = self._sku_time_sums[order] + (self._departure_time_lookup[departure] * self._n_skus_per_order[order])
+        
         self._order_times = order_times
         return order_times
 
@@ -231,15 +261,58 @@ class PTL:
         
         :return: List of zone processing times
         """
-        zone_times = {}
+        # Optimization: Use pre-allocated dictionary with zone indices
+        zone_times = {zone: 0.0 for zone in self._zones_set}
+        
+        # If order times haven't been computed, compute them
+        if not self._order_times:
+            self.compute_order_times()
+        
+        # Sum up times by zone
         for order, time in self._order_times.items():
             departure = self._solution[order]
-            zone = self._departures_per_zone[departure]
-            zone_times[zone] = zone_times.get(zone, 0) + time
+            zone = self._zone_lookup[departure]
+            zone_times[zone] += time
         
-        self._zone_times = list(zone_times.values())
+        # Convert to list in the correct order
+        self._zone_times = [zone_times[zone] for zone in self._zones_set]
         
         return self._zone_times
+
+    def update_solution(self, order: str, new_departure: str):
+        """
+        Optimization: Update a single order assignment and efficiently update related metrics.
+        
+        :param order: Order identifier
+        :param new_departure: New departure identifier
+        """
+        old_departure = self._solution[order]
+        
+        # Skip if no change
+        if old_departure == new_departure:
+            return
+        
+        # Update solution
+        self._solution[order] = new_departure
+        
+        # Update order time if already computed
+        if self._order_times:
+            old_time = self._order_times[order]
+            new_time = self.compute_order_time(order, new_departure)
+            self._order_times[order] = new_time
+            
+            # Update zone times if already computed
+            if self._zone_times:
+                old_zone = self._zone_lookup[old_departure]
+                new_zone = self._zone_lookup[new_departure]
+                
+                # Get zone indices
+                old_idx = self._zone_indices[old_zone]
+                new_idx = self._zone_indices[new_zone]
+                
+                # Update zone times
+                self._zone_times[old_idx] -= old_time
+                self._zone_times[new_idx] += new_time
 
     def save_solution(self, filename: str):
         """
@@ -247,7 +320,10 @@ class PTL:
 
         :param filename: Name of the Excel file to save
         """
-        
+        # Ensure zone times are computed
+        if not self._zone_times:
+            self.compute_total_zone_time()
+            
         # Obtener el índice de la zona con el máximo tiempo
         max_index = self._zone_times.index(max(self._zone_times))
 
@@ -275,7 +351,6 @@ class PTL:
             sheet1.to_excel(writer, sheet_name='Resumen', index=False)
             sheet2.to_excel(writer, sheet_name='Solucion', index=False)
             sheet3.to_excel(writer, sheet_name='Metricas', index=False)
-
     
     # Getter Methods
     def get_option(self) -> int:
@@ -405,3 +480,42 @@ class PTL:
                 f"Departures: {len(self._departures_set)}\n"
                 f"SKUs: {len(self._skus_set)}\n"
                 f"Workers: {len(self._workers_set)}")
+    
+    def copy(self):
+        """
+        Create a shallow copy of the PTL instance.
+        
+        :return: A new PTL instance with the same data
+        """
+        new_instance = PTL(self._option)
+        new_instance.logger = self.logger
+        new_instance._v = self._v
+        new_instance._zn = self._zn
+        new_instance._n_departures_per_zone = self._n_departures_per_zone.copy()
+        new_instance._n_orders = self._n_orders
+        new_instance._n_departures = self._n_departures
+        new_instance._departures_per_zone = self._departures_per_zone.copy()
+        new_instance._departure_time = self._departure_time.copy()
+        new_instance._total_departure_time = self._total_departure_time.copy()
+        new_instance._skus_per_order = self._skus_per_order.copy()
+        new_instance._n_skus_per_order = self._n_skus_per_order.copy()
+        new_instance._sku_time = self._sku_time.copy()
+        new_instance._solution = self._solution.copy()
+        new_instance._solution_correspondence = self._solution_correspondence.copy()
+        new_instance._order_times = self._order_times.copy()
+        new_instance._zone_times = self._zone_times.copy()
+        new_instance._option_data = self._option_data.copy()
+        new_instance._option = self._option
+        new_instance._orders_set = self._orders_set.copy()
+        new_instance._zones_set = self._zones_set.copy()
+        new_instance._departures_set = self._departures_set.copy()
+        new_instance._skus_set = self._skus_set.copy()
+        new_instance._workers_set = self._workers_set.copy()
+        
+        # Copy optimization data structures
+        new_instance._sku_time_sums = self._sku_time_sums.copy()
+        new_instance._departure_time_lookup = self._departure_time_lookup.copy()
+        new_instance._zone_lookup = self._zone_lookup.copy()
+        new_instance._zone_indices = self._zone_indices.copy()
+    
+        return new_instance
